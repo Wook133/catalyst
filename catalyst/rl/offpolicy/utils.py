@@ -10,6 +10,7 @@ from catalyst.rl.offpolicy.exploration.strategies import ParameterSpaceNoise
 from catalyst.rl.agents.core import ActorSpec, CriticSpec
 from catalyst.rl.environments.core import EnvironmentSpec
 
+from catalyst.utils.compression import compress, decompress
 
 def _get_buffers(
     observation_space: Space,
@@ -61,6 +62,203 @@ def _get_buffers(
         raise NotImplementedError()
 
     return observations, actions, rewards, dones
+
+
+class ReplayBufferDataset2(Dataset):
+    def __init__(
+        self,
+        observation_space: Space,
+        action_space: Space,
+        capacity=int(1e6),
+        n_step=1,
+        gamma=0.99,
+        history_len=1,
+        mode=None,
+        logdir=None
+    ):
+        """
+        Experience replay buffer for off-policy RL algorithms.
+
+        Args:
+            observation_shape: shape of environment observation
+                e.g. (8, ) for vector of floats or (84, 84, 3) for RGB image
+            action_shape: shape of action the agent can take
+                e.g. (3, ) for 3-dimensional continuous control
+            capacity: replay buffer capacity
+            history_len: number of subsequent observations considered a state
+            n_step: number of time steps between the current state and the next
+                state in TD backup
+            gamma: discount factor
+            discrete actions: True if actions are discrete
+        """
+        # @TODO: Refactor !!!
+        self.observation_space = observation_space
+        self.action_space = action_space
+        self.history_len = history_len
+
+        self.capacity = capacity
+        self.n_step = n_step
+        self.gamma = gamma
+
+        self._store_lock = mp.RLock()
+        self.len = 0
+
+        self._num_trajectories = 0
+        self._trajectories_lens = []
+        self._trajectories = []
+        self._trajectories_indices = None
+
+        # self.observations, self.actions, self.rewards, self.dones = \
+        #     _get_buffers(
+        #         capacity=capacity,
+        #         observation_space=observation_space,
+        #         action_space=action_space,
+        #         mode=mode,
+        #         logdir=logdir
+        #     )
+
+    def push_episode(self, episode):
+        with self._store_lock:
+            episode_len = len(episode[-1])
+            trajectory = compress(episode)
+            self._trajectories_lens.append(episode_len)
+            self._trajectories.append(trajectory)
+
+        # with self._store_lock:
+        #     observations, actions, rewards, dones = episode
+        #     episode_len = len(rewards)
+        #     self.len = min(self.len + episode_len, self.capacity)
+        #
+        #     indices = np.arange(
+        #         self.pointer, self.pointer + episode_len
+        #     ) % self.capacity
+        #     self.observations[indices] = np.array(observations)
+        #     self.actions[indices] = np.array(actions)
+        #     self.rewards[indices] = np.array(rewards)
+        #     self.dones[indices] = np.array(dones)
+        #
+        #     self.pointer = (self.pointer + episode_len) % self.capacity
+
+    def recalculate_index(self):
+        with self._store_lock:
+            if len(self._trajectories) == 0:
+                return
+
+            diff = self.len - self.capacity
+
+            trajectories_indixes = np.cumsum(self._trajectories_lens)
+            trajectories_indixes_mask = \
+                trajectories_indixes < diff
+            offset = np.where(
+                trajectories_indixes_mask,
+                trajectories_indixes,
+                0).argmax()
+
+            self._trajectories_lens = self._trajectories_lens[offset:]
+            self._trajectories = self._trajectories[offset:]
+
+            self._trajectories_indices = np.cumsum(self._trajectories_lens)
+            self.len = self._trajectories_indices[-1]
+
+    def _get_double_index(self, flatten_index):
+        trajectories_indices_mask = \
+            self._trajectories_indices < flatten_index
+        trajectory_index = np.where(
+            trajectories_indices_mask,
+            self._trajectories_indices,
+            0).argmax()
+        flatten_index -= self._trajectories_indices[trajectory_index]
+        return trajectory_index, flatten_index
+
+    def get_state(self, idx, observations, history_len=1):
+        """
+        compose the state from a number (history_len) of observations
+        """
+        start_idx = idx - history_len + 1
+        capacity = len(observations)
+
+        if start_idx < 0 or idx > capacity:
+            state = np.zeros(
+                (history_len,) + self.observation_space.shape,
+                dtype=self.observation_space.dtype
+            )
+            indices = [idx]
+            for i in range(history_len - 1):
+                next_idx = (idx - i - 1) % capacity
+                if next_idx >= capacity:
+                    break
+                indices.append(next_idx)
+            indices = indices[::-1]
+            state[-len(indices):] = observations[indices]
+        else:
+            state = observations[slice(start_idx, idx + 1, 1)]
+
+        return state
+
+    def get_transition_n_step(
+        self,
+        trajectory_index,
+        transition_index,
+        flatten_index,
+        history_len=1,
+        n_step=1,
+        gamma=0.99
+    ):
+        trajectory = self._trajectories[trajectory_index]
+        observations, actions, rewards, dones = decompress(trajectory)
+        capacity = len(observations)
+
+        # hack to testing
+        if transition_index >= capacity - n_step:
+            transition_index = capacity - n_step - 1
+        if transition_index <= n_step:
+            transition_index = n_step + 1
+        # try:
+        #     assert transition_index < capacity
+        # except:
+        #     transition_index = capacity - n_step - 1
+            # import ipdb; ipdb.set_trace()
+            # print("bug")
+
+        state = self.get_state(transition_index, observations, history_len)
+        next_state = self.get_state(
+            (transition_index + n_step), observations, history_len
+        )
+
+        cum_reward = 0
+        indices = np.arange(transition_index, transition_index + n_step) % capacity
+        for num, i in enumerate(indices):
+            cum_reward += rewards[i] * (gamma ** num)
+            done = dones[i]
+            if done:
+                break
+        return state, actions[transition_index], cum_reward, next_state, done
+
+    def __getitem__(self, flatten_index):
+        trajectory_index, transition_index = \
+            self._get_double_index(flatten_index)
+
+        state, action, reward, next_state, done = \
+            self.get_transition_n_step(
+                trajectory_index=trajectory_index,
+                transition_index=transition_index,
+                flatten_index=flatten_index,
+                history_len=self.history_len,
+                n_step=self.n_step,
+                gamma=self.gamma)
+
+        dct = {
+            "state": np.array(state).astype(np.float32),
+            "action": np.array(action).astype(np.float32),
+            "reward": np.array(reward).astype(np.float32),
+            "next_state": np.array(next_state).astype(np.float32),
+            "done": np.array(done).astype(np.float32)
+        }
+
+        return dct
+
+    def __len__(self):
+        return self.len
 
 
 class ReplayBufferDataset(Dataset):
@@ -199,7 +397,7 @@ class ReplayBufferSampler(Sampler):
 
     def __iter__(self):
         indices = np.random.choice(range(len(self.buffer)), size=self.len)
-        return iter(indices)
+        return iter(sorted(indices))
 
     def __len__(self):
         return self.len
